@@ -553,7 +553,9 @@ def make_pet_zip(animal: str, on_progress=None, breed_id=None):
             str(base), seed)))
 
     prog("Cutting out backgrounds & packing…", 0.85)
-    # Unload ComfyUI's Wan models so the GPU has room for birefnet.
+    # Unload ComfyUI's Wan models so the GPU has room for birefnet. The /free
+    # endpoint returns immediately but releases VRAM asynchronously (~8s), so
+    # wait for the memory to actually drop before starting the CUDA cutout.
     try:
         requests.post(f"{COMFY_URL}/free", json={"unload_models": True, "free_memory": True}, timeout=10)
     except Exception:
