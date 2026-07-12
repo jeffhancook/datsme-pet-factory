@@ -26,48 +26,49 @@ finished DatsMe pet — all generated locally on a graphics card, no paid AI API
    [ STEP 1: DRAW THE BASE SPRITE ]  ~10s
    A text-to-image model (Z-Image) draws one still picture of the animal,
    standing in side profile, facing right, on a white background, in a soft
-   cartoon "storybook" style. This single picture is the character that both
-   animations will be built from — so the walk and the idle look like the same
-   pet (not two different-looking red pandas).
+   cartoon "storybook" style. This single picture is the character that ALL the
+   animations will be built from — so every animation looks like the same pet
+   (not two different-looking red pandas).
         |
         v
-   [ STEP 2: ANIMATE THE WALK ]  ~70s
-   An image-to-video model (Wan 2.2) takes that still and animates it into a
-   short looping clip of the animal doing a walk cycle IN PLACE (legs moving,
-   body bobbing, but not sliding across the screen — the game moves the pet
-   around; the sprite just needs to look like it's walking). It's made to loop
-   seamlessly (first frame = last frame). ~16 frames.
+   [ STEP 2: ANIMATE EACH ANIMATION ]  ~70s each
+   The pet gets an animal-appropriate SET of animations (an "idle" rest loop plus
+   one or more motion loops): a bird gets idle + fly + hop, a fish idle + swim,
+   most mammals idle + walk. For each one, an image-to-video model (Wan 2.2)
+   takes the SAME base still and animates it into a short looping clip of that
+   action IN PLACE (legs/wings moving, body bobbing, but not sliding across the
+   screen — the game moves the pet around; the sprite just needs to look like
+   it's doing the action). Each clip loops seamlessly (first frame = last frame),
+   ~16 frames. This step repeats once per animation in the set, which is why more
+   animations means a longer total time.
         |
         v
-   [ STEP 3: ANIMATE THE IDLE ]  ~70s
-   The SAME still is animated again, this time into a gentle "idle" loop
-   (breathing, a small sway) for when the pet is standing still. ~16 frames.
-        |
-        v
-   [ STEP 4: CUT OUT THE BACKGROUND ]  ~13s on GPU
-   Each of the ~32 frames still has a white background. An AI cutout model
+   [ STEP 3: CUT OUT THE BACKGROUND ]  ~13s per animation on GPU
+   Every frame of every animation still has a white background. An AI cutout model
    (birefnet) finds the animal in each frame and makes everything else
    transparent, so the pet can sit on any web page without a white box around it.
         |
         v
-   [ STEP 5: PACK IT INTO A DATSME BUNDLE ]  <1s
+   [ STEP 4: PACK IT INTO A DATSME BUNDLE ]  <1s
    All the frames are shrunk to a uniform size and laid out in a grid on one big
-   transparent PNG ("sprite sheet"). A manifest.json is written that says which
-   grid cells belong to "walk" vs "idle", how fast to play them, etc. It's all
-   zipped up.
+   transparent PNG ("sprite sheet"). Each animation is laid out on its own grid
+   rows. A manifest.json is written that says which grid cells belong to which
+   animation ("walk", "fly", "idle"…), how fast to play them, and which is the
+   resting one, etc. It's all zipped up.
         |
         v
-   ("red_panda", <zip bytes>)         Total: ~3 minutes on an RTX 3090.
+   ("red_panda", <zip bytes>)   Total: ~3–5 minutes on an RTX 3090 (more
+                                animations = longer).
 
 
 --------------------------------------------------------------------------------
  3. WHY THE DESIGN CHOICES
 --------------------------------------------------------------------------------
 
-* One base sprite for BOTH animations.
-  Generating the walk and idle from the same still keeps the character
-  identical. Generating two separate stills would give you two subtly different
-  animals.
+* One base sprite for ALL animations.
+  Generating every animation from the same still keeps the character identical.
+  Generating a separate still per animation would give you subtly different
+  animals across the set.
 
 * "facing right" is forced in the prompt.
   DatsMe stores pets facing right and automatically mirrors them when the pet
@@ -91,9 +92,9 @@ finished DatsMe pet — all generated locally on a graphics card, no paid AI API
 
 * GPU for the cutout.
   Running birefnet on the graphics card instead of the CPU is ~12x faster
-  (~0.4s/frame vs ~4.6s/frame), cutting total time from ~5 min to ~3 min, with
-  no loss of quality. It falls back to CPU automatically if the GPU libraries
-  aren't set up.
+  (~0.4s/frame vs ~4.6s/frame), keeping the cutout stage fast even with several
+  animations to process, with no loss of quality. It falls back to CPU
+  automatically if the GPU libraries aren't set up.
 
 
 --------------------------------------------------------------------------------
@@ -178,7 +179,7 @@ So "let users make their own pet" is basically:
 
     user types an animal
         -> DatsMe backend puts a job on the queue
-        -> the GPU worker generates the .zip (~3 min)
+        -> the GPU worker generates the .zip (~3–5 min)
         -> DatsMe either:
              (a) feeds the .zip to its own /api/pets/me/upload path, or
              (b) writes it straight into the user's pet storage with

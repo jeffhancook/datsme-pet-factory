@@ -10,13 +10,19 @@ open(f"{breed_id}.zip", "wb").write(zip_bytes)
 ```
 
 The `.zip` is a complete **DatsMe breed bundle** (a transparent sprite sheet +
-`manifest.json` + `package.json`) with a **walk** and an **idle** animation —
-exactly the shape DatsMe's `POST /api/pets/me/upload` already accepts. It's
-generated entirely locally on a GPU (no paid APIs).
+`manifest.json` + `package.json`) with an **animal-appropriate set of
+animations** — exactly the shape DatsMe's `POST /api/pets/me/upload` already
+accepts. It's generated entirely locally on a GPU (no paid APIs).
 
-Pipeline: `animal → Z-Image base sprite (side profile, facing right) → Wan 2.2
-I2V walk loop + idle loop → birefnet background removal → packed .zip`.
-Takes **~3 minutes** on an RTX 3090.
+By default each animal gets a fitting set (an **idle** rest loop plus one or more
+motion loops): a bird gets **idle + fly + hop**, a fish **idle + swim**, rabbits
+and frogs **idle + hop + walk**, and most mammals **idle + walk**. You can also
+pass an explicit list, e.g. `make_pet_zip("owl", animations=["idle","fly"])`.
+Available animations: `idle, walk, run, fly, hop, swim`.
+
+Pipeline: `animal → Z-Image base sprite (side profile, facing right) → one Wan
+2.2 I2V loop per animation → birefnet background removal → packed .zip`.
+Takes **~3–5 minutes** on an RTX 3090 (depending on how many animations).
 
 ---
 
@@ -119,11 +125,24 @@ It falls back to CPU automatically if these aren't found (just slower — no cra
 ## Public API
 
 ```python
-make_pet_zip(animal, on_progress=None, breed_id=None) -> (breed_id, zip_bytes)
-pack_datsme_bundle(walk_frames, idle_frames, breed_id, display_name, ...) -> zip_bytes
+make_pet_zip(animal, on_progress=None, breed_id=None, animations=None) -> (breed_id, zip_bytes)
+pack_datsme_bundle(anims, breed_id, display_name, ...) -> zip_bytes
 ```
 
 `on_progress(message, fraction)` is called through the run for UI progress.
+`animations` is an optional list of preset names (`idle, walk, run, fly, hop,
+swim`); omit it to get an animal-appropriate default set. `idle` is always
+included and at least one motion animation is guaranteed.
+
+`pack_datsme_bundle`'s `anims` is an ordered list of
+`{"name": str, "frames": [PIL images], "role": "rest"|"active"}` — one entry per
+animation; each is laid out on its own grid rows.
+
+> **DatsMe runtime note:** the current DatsMe quadruped runtime only carries a
+> pet *across the screen* for an animation **named `walk` or `run`**; `fly`,
+> `hop`, and `swim` play **in place**. So a bird will flap and hop where it
+> stands until DatsMe adds a flying/hopping locomotion strategy. Everything is
+> still a valid bundle and plays — this only affects horizontal travel.
 
 ## Output format (DatsMe breed bundle)
 
@@ -133,15 +152,20 @@ Frames are laid out in a grid; the runtime maps a frame index to a cell as
 
 ```json
 {
-  "columns": 8, "rows": 4, "frame_width": 256, "frame_height": 256,
+  "schema_version": "pet_manifest.v1",
+  "columns": 8, "rows": 6, "frame_width": 256, "frame_height": 256,
   "animations": {
-    "walk": { "frames": [0,1,...,15], "fps": 12, "loop": true, "runtime_role": "active" },
-    "idle": { "frames": [16,...,31], "fps": 12, "loop": true, "runtime_role": "rest" }
+    "idle": { "frames": [0,...,15],  "fps": 12, "loop": true, "runtime_role": "rest",   "rest_dwell_ms": [2000, 5000] },
+    "fly":  { "frames": [16,...,31], "fps": 12, "loop": true, "runtime_role": "active", "pick_weight": 1.0 },
+    "hop":  { "frames": [32,...,47], "fps": 12, "loop": true, "runtime_role": "active", "pick_weight": 1.0 }
   },
   "view_kind": "side", "native_facing": "right",
   "mirroring_policy": "flip", "movement_class": "mammalian_quadruped"
 }
 ```
+
+Each animation occupies its own grid rows. The `rest` animation is what plays
+when the pet is standing still; `active` animations are the motion loops.
 
 ## Notes
 

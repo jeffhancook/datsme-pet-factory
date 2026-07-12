@@ -68,6 +68,63 @@ WALK_SUFFIX = (", mouth closed, no facial animation, no chewing, no talking, eye
 IDLE_SUFFIX = (", mouth closed, no facial animation, no chewing, no talking, eyes still, "
                "gentle idle motion: soft breathing, slight sway, a small bob in place, "
                "no walking, no camera movement, no panning")
+RUN_SUFFIX = (", mouth closed, no facial animation, eyes still, running in place: legs "
+              "cycling quickly through a full run stride, body bobbing energetically with "
+              "each stride, fast looping run animation, no horizontal movement of the body, "
+              "no camera movement, no panning")
+FLY_SUFFIX = (", mouth closed, no facial animation, eyes still, flying in mid-air: wings "
+              "beating up and down through full flap cycles, body rising and dipping gently "
+              "with each wingbeat, hovering in place, no horizontal movement of the body, "
+              "no camera movement, no panning")
+HOP_SUFFIX = (", mouth closed, no facial animation, eyes still, hopping in place: crouching "
+              "down then springing up and landing in a small bounce, body compressing and "
+              "extending, repeating hop cycle, no horizontal movement of the body, "
+              "no camera movement, no panning")
+SWIM_SUFFIX = (", mouth closed, no facial animation, eyes still, swimming in place: fins and "
+               "body gently undulating, tail swishing side to side, floating and gliding "
+               "motion, no horizontal movement of the body, no camera movement, no panning")
+
+# Animation presets: manifest name -> (what the animal is doing, Wan motion steering,
+# DatsMe runtime_role). "rest" = plays when idle; "active" = plays while the pet moves.
+# NOTE: DatsMe's current runtime only carries the pet across the screen for an
+# animation NAMED "walk" or "run" (quadruped strategy); fly/hop/swim play in place
+# (or on trigger) until DatsMe adds a matching locomotion strategy.
+ANIM_PRESETS = {
+    "idle": {"action": "sitting calmly, resting",                "suffix": IDLE_SUFFIX, "role": "rest"},
+    "walk": {"action": "walking",                                "suffix": WALK_SUFFIX, "role": "active"},
+    "run":  {"action": "running fast",                           "suffix": RUN_SUFFIX,  "role": "active"},
+    "fly":  {"action": "flying with wings spread, mid-air",      "suffix": FLY_SUFFIX,  "role": "active"},
+    "hop":  {"action": "hopping",                                "suffix": HOP_SUFFIX,  "role": "active"},
+    "swim": {"action": "swimming",                               "suffix": SWIM_SUFFIX, "role": "active"},
+}
+
+# Keyword heuristics to pick an animal-appropriate default animation set from just
+# the name. Order matters: flyers checked before swimmers before hoppers.
+_FLYERS = ("bird", "jay", "robin", "sparrow", "finch", "cardinal", "eagle", "hawk", "owl",
+           "falcon", "parrot", "crow", "raven", "dove", "pigeon", "duck", "goose", "swan",
+           "seagull", "gull", "hummingbird", "woodpecker", "toucan", "flamingo", "peacock",
+           "chickadee", "wren", "bluebird", "dragon", "bat", "butterfly", "moth", "bee",
+           "wasp", "dragonfly", "fairy", "phoenix", "pegasus", "pterodactyl", "griffin")
+_SWIMMERS = ("fish", "shark", "whale", "dolphin", "orca", "octopus", "squid", "jellyfish",
+             "seahorse", "eel", "stingray", "koi", "goldfish", "clownfish", "betta",
+             "crab", "lobster", "seal", "otter", "manatee", "narwhal")
+_HOPPERS = ("rabbit", "bunny", "hare", "frog", "toad", "kangaroo", "wallaby", "grasshopper",
+            "cricket", "flea")
+
+
+def _default_animations(animal: str) -> list:
+    """Pick an animal-appropriate default animation set from the name alone.
+    Birds/dragons/bats -> idle+fly+hop, fish -> idle+swim,
+    rabbits/frogs -> idle+hop+walk, everything else -> idle+walk."""
+    a = animal.lower()
+    if any(k in a for k in _FLYERS):
+        return ["idle", "fly", "hop"]
+    if any(k in a for k in _SWIMMERS):
+        return ["idle", "swim"]
+    if any(k in a for k in _HOPPERS):
+        return ["idle", "hop", "walk"]
+    return ["idle", "walk"]
+
 
 _REMBG = None
 
@@ -256,49 +313,59 @@ def _base_prompt(animal: str) -> str:
             "storybook style")
 
 
-def pack_datsme_bundle(walk_frames, idle_frames, breed_id, display_name,
-                       frame_size=256, columns=8, fps=12,
-                       movement_class="mammalian_quadruped") -> bytes:
-    """Pack two frame lists (RGB or RGBA PIL images) into a DatsMe breed bundle
-    (.zip bytes): a transparent sprite sheet + manifest.json + package.json.
+def _cutout_cells(frames, frame_size):
+    """birefnet cutout + fit each frame into a square transparent cell."""
+    out = []
+    for fr in frames:
+        orig = fr.convert("RGB")
+        try:
+            a = _remove_bg(orig).convert("RGBA").split()[3]     # birefnet alpha matte
+        except Exception:
+            a = Image.new("L", orig.size, 255)
+        result = orig.convert("RGBA")
+        result.putalpha(a)                                     # original colors + matte
+        cell = _fit_square(result, frame_size)
+        cell.putalpha(_fill_holes_alpha(cell.split()[3]))      # close interior holes
+        out.append(cell)
+    return out
 
-    Each frame is background-removed (birefnet) and fit into a square cell. The
-    walk animation gets frame indices 0..N-1, idle starts on a fresh grid row.
-    Returns the .zip as bytes — post it to DatsMe's /api/pets/me/upload."""
-    def prep(frames):
-        out = []
-        for fr in frames:
-            orig = fr.convert("RGB")
-            try:
-                a = _remove_bg(orig).convert("RGBA").split()[3]     # birefnet alpha matte
-            except Exception:
-                a = Image.new("L", orig.size, 255)
-            result = orig.convert("RGBA")
-            result.putalpha(a)                                     # original colors + matte
-            cell = _fit_square(result, frame_size)
-            cell.putalpha(_fill_holes_alpha(cell.split()[3]))      # close interior holes
-            out.append(cell)
-        return out
 
-    A, B = prep(walk_frames), prep(idle_frames)
-    idx_a = list(range(len(A)))
-    start_b = ((len(A) + columns - 1) // columns) * columns        # idle starts on a new row
-    idx_b = list(range(start_b, start_b + len(B)))
-    rows = (start_b + len(B) + columns - 1) // columns
+def pack_datsme_bundle(anims, breed_id, display_name, frame_size=256, columns=8,
+                       fps=12, movement_class="mammalian_quadruped") -> bytes:
+    """Pack N animations into one DatsMe breed bundle (.zip bytes): a transparent
+    sprite sheet + manifest.json + package.json.
+
+    `anims` = ordered list of {"name": str, "frames": [PIL images], "role": str}.
+    Each animation's frames are background-removed (birefnet), laid on a fresh grid
+    row, and given frame indices; the manifest maps col = idx % columns,
+    row = idx // columns. Roles are DatsMe runtime_roles ("rest" plays when idle,
+    "active" while moving). Returns the .zip as bytes — post it to DatsMe's
+    /api/pets/me/upload."""
+    placed = []            # (index, cell) across all animations
+    manifest_anims = {}
+    cursor = 0
+    for a in anims:
+        cells = _cutout_cells(a["frames"], frame_size)
+        start = ((cursor + columns - 1) // columns) * columns   # each anim starts on a new row
+        idx = list(range(start, start + len(cells)))
+        placed.extend(zip(idx, cells))
+        entry = {"frames": idx, "fps": fps, "loop": True, "runtime_role": a["role"]}
+        if a["role"] == "rest":
+            entry["rest_dwell_ms"] = [2000, 5000]
+        else:
+            entry["pick_weight"] = 1.0
+        manifest_anims[a["name"]] = entry
+        cursor = start + len(cells)
+    rows = (cursor + columns - 1) // columns
 
     sheet = Image.new("RGBA", (columns * frame_size, rows * frame_size), (0, 0, 0, 0))
-    for i, fr in zip(idx_a, A):
-        sheet.paste(fr, ((i % columns) * frame_size, (i // columns) * frame_size), fr)
-    for i, fr in zip(idx_b, B):
-        sheet.paste(fr, ((i % columns) * frame_size, (i // columns) * frame_size), fr)
+    for i, cell in placed:
+        sheet.paste(cell, ((i % columns) * frame_size, (i // columns) * frame_size), cell)
 
     manifest = {
         "schema_version": "pet_manifest.v1",
         "columns": columns, "rows": rows, "frame_width": frame_size, "frame_height": frame_size,
-        "animations": {
-            "walk": {"frames": idx_a, "fps": fps, "loop": True, "runtime_role": "active"},
-            "idle": {"frames": idx_b, "fps": fps, "loop": True, "runtime_role": "rest"},
-        },
+        "animations": manifest_anims,
         "view_kind": "side", "native_facing": "right",
         "mirroring_policy": "flip", "movement_class": movement_class,
     }
@@ -313,16 +380,23 @@ def pack_datsme_bundle(walk_frames, idle_frames, breed_id, display_name,
     return buf.getvalue()
 
 
-def make_pet_zip(animal: str, on_progress=None, breed_id=None):
+def make_pet_zip(animal: str, on_progress=None, breed_id=None, animations=None):
     """Generate a complete DatsMe pet from an animal name.
 
     Args:
         animal:       e.g. "red panda", "penguin", "baby dragon".
         on_progress:  optional callback(message: str, fraction: float in 0..1).
         breed_id:     optional slug override (else derived from `animal`).
+        animations:   optional list of preset names from ANIM_PRESETS
+                      (e.g. ["idle", "fly", "hop"]). Defaults to an
+                      animal-appropriate set — a bird gets idle+fly+hop, a fish
+                      idle+swim, most mammals idle+walk. "idle" is always
+                      included, and at least one motion animation is guaranteed.
 
-    Returns (breed_id, zip_bytes). Takes ~3 min on an RTX 3090. The .zip is a
-    DatsMe breed bundle — upload it via DatsMe's POST /api/pets/me/upload.
+    Generates one looping animation per name from a single shared base sprite,
+    then packs a DatsMe bundle. Returns (breed_id, zip_bytes). Takes ~3-5 min on
+    an RTX 3090 depending on how many animations. The .zip is a DatsMe breed
+    bundle — upload it via DatsMe's POST /api/pets/me/upload.
     """
     def prog(msg, pct):
         if on_progress:
@@ -331,17 +405,24 @@ def make_pet_zip(animal: str, on_progress=None, breed_id=None):
     animal = (animal or "").strip()[:60] or "pet"
     seed = random.randint(1, 2**31)
 
-    prog("Drawing the base sprite…", 0.10)
+    names = [n for n in (animations or _default_animations(animal)) if n in ANIM_PRESETS]
+    if "idle" not in names:                      # DatsMe needs a rest animation
+        names = ["idle"] + names
+    if len(names) < 2:                           # always at least idle + one motion
+        names = names + ["walk"]
+
+    prog("Drawing the base sprite…", 0.08)
     base = COMFY_OUTPUT_DIR / _run(_static_image_wf(_base_prompt(animal), seed))
     _wait_stable(base)
 
-    prog("Animating the walk…", 0.35)
-    walk_fn = _run(_loop_wf(f"cute cartoon {animal} walking, side profile, facing right" + WALK_SUFFIX,
-                            str(base), seed))
-
-    prog("Animating the idle…", 0.60)
-    idle_fn = _run(_loop_wf(f"cute cartoon {animal} sitting calmly, side profile, facing right" + IDLE_SUFFIX,
-                            str(base), seed))
+    # One Wan loop per animation, all from the same base sprite.
+    loop_files = {}
+    for i, name in enumerate(names):
+        p = ANIM_PRESETS[name]
+        prog(f"Animating the {name}…", 0.10 + 0.72 * (i / len(names)))
+        loop_files[name] = _run(_loop_wf(
+            f"cute cartoon {animal} {p['action']}, side profile, facing right" + p["suffix"],
+            str(base), seed))
 
     prog("Cutting out backgrounds & packing…", 0.85)
     # Unload ComfyUI's Wan models so the GPU has room for birefnet (the next job
@@ -352,14 +433,14 @@ def make_pet_zip(animal: str, on_progress=None, breed_id=None):
     except Exception:
         pass
 
-    walk_frames = _frames_rgba(COMFY_OUTPUT_DIR / walk_fn)
-    idle_frames = _frames_rgba(COMFY_OUTPUT_DIR / idle_fn)
-    if len(walk_frames) > 1:                 # drop the duplicated final loop frame
-        walk_frames = walk_frames[:-1]
-    if len(idle_frames) > 1:
-        idle_frames = idle_frames[:-1]
+    anims = []
+    for name in names:
+        frames = _frames_rgba(COMFY_OUTPUT_DIR / loop_files[name])
+        if len(frames) > 1:                      # drop the duplicated final loop frame
+            frames = frames[:-1]
+        anims.append({"name": name, "frames": frames, "role": ANIM_PRESETS[name]["role"]})
 
     breed_id = breed_id or _slug(animal)
-    zip_bytes = pack_datsme_bundle(walk_frames, idle_frames, breed_id, animal.title())
+    zip_bytes = pack_datsme_bundle(anims, breed_id, animal.title())
     prog("Done!", 1.0)
     return breed_id, zip_bytes
