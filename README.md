@@ -10,19 +10,31 @@ open(f"{breed_id}.zip", "wb").write(zip_bytes)
 ```
 
 The `.zip` is a complete **DatsMe breed bundle** (a transparent sprite sheet +
-`manifest.json` + `package.json`) with an **animal-appropriate set of
-animations** — exactly the shape DatsMe's `POST /api/pets/me/upload` already
-accepts. It's generated entirely locally on a GPU (no paid APIs).
+`manifest.json` + `package.json`) — exactly the shape DatsMe's
+`POST /api/pets/me/upload` already accepts. It's generated entirely locally on
+a GPU (no paid APIs).
 
-By default each animal gets a fitting set (an **idle** rest loop plus one or more
-motion loops): a bird gets **idle + fly + hop**, a fish **idle + swim**, rabbits
-and frogs **idle + hop + walk**, and most mammals **idle + walk**. You can also
-pass an explicit list, e.g. `make_pet_zip("owl", animations=["idle","fly"])`.
-Available animations: `idle, walk, run, fly, hop, swim`.
+Every pet gets **four animations**: `idle` (rest), `walk` + `run` (the two
+gaits DatsMe's runtime actually carries across the screen), and `excited`
+(the reaction DatsMe plays when the user **clicks** their pet). What the
+walk/run *look like* is tailored to the kind of animal:
 
-Pipeline: `animal → Z-Image base sprite (side profile, facing right) → one Wan
-2.2 I2V loop per animation → birefnet background removal → packed .zip`.
-Takes **~3–5 minutes** on an RTX 3090 (depending on how many animations).
+| Category | walk looks like | run looks like | example |
+|---|---|---|---|
+| flyer | hopping | flying | blue jay, dragon, bat |
+| swimmer | slow swim | fast dart | goldfish, shark, turtle |
+| hopper | small hops | big leaps | rabbit, frog, kangaroo |
+| crawler | slow slither | fast slither | snake, lizard, snail |
+| default | walking | running | dog, cat, red panda |
+
+This naming matters: DatsMe's locomotion runtime only *moves* a pet for
+animations literally named `walk`/`run`, so mapping each animal's natural
+gaits onto those two names is what makes a bird actually fly around the page
+instead of flapping in place.
+
+Pipeline: `animal → Z-Image base sprite (side profile, facing right, pose per
+category) → one Wan 2.2 I2V loop per animation → birefnet background removal
+→ packed .zip`. Takes **~5 minutes** on an RTX 3090.
 
 ---
 
@@ -125,24 +137,15 @@ It falls back to CPU automatically if these aren't found (just slower — no cra
 ## Public API
 
 ```python
-make_pet_zip(animal, on_progress=None, breed_id=None, animations=None) -> (breed_id, zip_bytes)
+make_pet_zip(animal, on_progress=None, breed_id=None) -> (breed_id, zip_bytes)
 pack_datsme_bundle(anims, breed_id, display_name, ...) -> zip_bytes
 ```
 
 `on_progress(message, fraction)` is called through the run for UI progress.
-`animations` is an optional list of preset names (`idle, walk, run, fly, hop,
-swim`); omit it to get an animal-appropriate default set. `idle` is always
-included and at least one motion animation is guaranteed.
 
 `pack_datsme_bundle`'s `anims` is an ordered list of
-`{"name": str, "frames": [PIL images], "role": "rest"|"active"}` — one entry per
-animation; each is laid out on its own grid rows.
-
-> **DatsMe runtime note:** the current DatsMe quadruped runtime only carries a
-> pet *across the screen* for an animation **named `walk` or `run`**; `fly`,
-> `hop`, and `swim` play **in place**. So a bird will flap and hop where it
-> stands until DatsMe adds a flying/hopping locomotion strategy. Everything is
-> still a valid bundle and plays — this only affects horizontal travel.
+`{"name": str, "frames": [PIL images], "role": "rest"|"active"|"timed",
+"fps": int}` — one entry per animation; each is laid out on its own grid rows.
 
 ## Output format (DatsMe breed bundle)
 
@@ -153,19 +156,46 @@ Frames are laid out in a grid; the runtime maps a frame index to a cell as
 ```json
 {
   "schema_version": "pet_manifest.v1",
-  "columns": 8, "rows": 6, "frame_width": 256, "frame_height": 256,
+  "columns": 8, "rows": 8, "frame_width": 256, "frame_height": 256,
   "animations": {
-    "idle": { "frames": [0,...,15],  "fps": 12, "loop": true, "runtime_role": "rest",   "rest_dwell_ms": [2000, 5000] },
-    "fly":  { "frames": [16,...,31], "fps": 12, "loop": true, "runtime_role": "active", "pick_weight": 1.0 },
-    "hop":  { "frames": [32,...,47], "fps": 12, "loop": true, "runtime_role": "active", "pick_weight": 1.0 }
+    "idle":    { "frames": [0,...,15],  "fps": 10, "loop": true, "runtime_role": "rest",
+                 "rest_dwell_ms": [2000, 5000], "view": {"view_kind": "side"} },
+    "walk":    { "frames": [16,...,31], "fps": 12, "loop": true, "runtime_role": "active",
+                 "view": {"view_kind": "side"} },
+    "run":     { "frames": [32,...,47], "fps": 16, "loop": true, "runtime_role": "active",
+                 "view": {"view_kind": "side"} },
+    "excited": { "frames": [48,...,63], "fps": 14, "loop": true, "runtime_role": "timed",
+                 "timed_buffer_ms": 2400, "view": {"view_kind": "side"} }
   },
   "view_kind": "side", "native_facing": "right",
   "mirroring_policy": "flip", "movement_class": "mammalian_quadruped"
 }
 ```
 
-Each animation occupies its own grid rows. The `rest` animation is what plays
-when the pet is standing still; `active` animations are the motion loops.
+Every field here is one the DatsMe runtime actually reads (verified against
+its source):
+
+- Each animation occupies its own grid rows; per-animation **fps** is honored
+  (run plays at 16 for energy, idle at 10 for calm).
+- `runtime_role: "rest"` is what plays when the pet stands still
+  (`rest_dwell_ms` is how long it rests before wandering again).
+- `runtime_role: "active"` animations named `walk`/`run` are the ones the
+  runtime moves across the screen.
+- `runtime_role: "timed"` + the literal name `excited` = the click reaction:
+  DatsMe triggers it when the user clicks the pet, plays it for
+  `timed_buffer_ms`, then returns to rest. It is never auto-played.
+- The per-animation `view.view_kind: "side"` on walk/run is what enables the
+  directional tilt (nose-up when climbing) in DatsMe's renderer.
+
+## DatsMe upload behavior worth knowing
+
+- Uploading the **same breed_id twice creates a second pet**, not a replace —
+  DatsMe does not dedupe user uploads by breed_id.
+- Users have a hard **cap of 3 pets**; the 4th upload returns HTTP 409.
+- Server-side validation is minimal (zip ≤ 32 MB, safe paths, a parseable
+  `animations` dict, a top-level PNG). DatsMe does **not** validate the sprite
+  image itself, so a malformed sheet only fails visually at render time —
+  which is why this factory fails a job loudly rather than ship a bad frame.
 
 ## Notes
 

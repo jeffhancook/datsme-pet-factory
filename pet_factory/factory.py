@@ -8,8 +8,8 @@ The .zip is a DatsMe "breed bundle" (sprite sheet + manifest.json + package.json
 — exactly the shape DatsMe's `POST /api/pets/me/upload` accepts. See README.
 
 Pipeline (all local on a CUDA GPU box running ComfyUI):
-    animal -> Z-Image base sprite (side profile, facing right)
-           -> Wan 2.2 I2V walk loop + idle loop (from the same base sprite)
+    animal -> Z-Image base sprite (side profile, facing right, pose per category)
+           -> Wan 2.2 I2V loops: idle + walk + run + excited (same base sprite)
            -> birefnet background removal (GPU) -> packed DatsMe .zip
 
 Config via environment variables (all optional):
@@ -22,13 +22,12 @@ import io
 import json
 import os
 import random
-import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 import zipfile
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -42,24 +41,20 @@ COMFY_OUTPUT_DIR = Path(os.environ.get(
 CLIENT_ID = uuid.uuid4().hex
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 
-# Model filenames as they appear in ComfyUI's models/ folders. The GPU box must
-# have these installed (see README "Requirements").
 ZIMAGE_UNET = "zImageTurbo_turbo.safetensors"
 ZIMAGE_VAE = "zimage_ae.safetensors"
 ZIMAGE_TE = "qwen_3_4b_fp8.safetensors"
 WAN_UNET_HIGH = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
 WAN_UNET_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
-WAN_VAE = "wan_2.1_vae.safetensors"           # 14B I2V uses the Wan 2.1 VAE
+WAN_VAE = "wan_2.1_vae.safetensors"
 WAN_TE = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 WAN_LORA_HIGH = "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
 WAN_LORA_LOW = "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
 
-NEG = ("oversaturated, neon, vibrant, hyper-colored, anime, blurry, photo, "
-       "realistic, low quality, watermark, signature, multiple subjects, "
-       "deformed, human, person, hands, text")
+# NOTE: no negative prompt anywhere in this pipeline — both Z-Image turbo and
+# the Wan lightx2v 4-step loras sample at CFG 1.0, where the negative is
+# mathematically ignored. All steering must live in the POSITIVE prompt.
 
-# Motion suffixes: keep the face still and the body anchored in place (the pet
-# runtime handles horizontal movement), and ask for a clean looping cycle.
 WALK_SUFFIX = (", mouth closed, no facial animation, no chewing, no talking, eyes still, "
                "performing a full walk cycle in place: legs and feet cycling through one "
                "complete stride, body bobbing naturally up and down with each step, classic "
@@ -83,86 +78,217 @@ HOP_SUFFIX = (", mouth closed, no facial animation, eyes still, hopping in place
 SWIM_SUFFIX = (", mouth closed, no facial animation, eyes still, swimming in place: fins and "
                "body gently undulating, tail swishing side to side, floating and gliding "
                "motion, no horizontal movement of the body, no camera movement, no panning")
+CRAWL_SUFFIX = (", mouth closed, no facial animation, eyes still, crawling forward in place: "
+                "long body and belly undulating in a slithering wave, creeping motion "
+                "cycling in place, no horizontal movement of the body, no camera movement, "
+                "no panning")
+EXCITED_SUFFIX = (", mouth closed, no facial animation, eyes still, excited happy reaction "
+                  "in place: quick joyful bouncing and wiggling, energetic but staying in "
+                  "one spot, no horizontal movement of the body, no camera movement, "
+                  "no panning")
 
-# Animation presets: manifest name -> (what the animal is doing, Wan motion steering,
-# DatsMe runtime_role). "rest" = plays when idle; "active" = plays while the pet moves.
-# NOTE: DatsMe's current runtime only carries the pet across the screen for an
-# animation NAMED "walk" or "run" (quadruped strategy); fly/hop/swim play in place
-# (or on trigger) until DatsMe adds a matching locomotion strategy.
-ANIM_PRESETS = {
-    "idle": {"action": "sitting calmly, resting",                "suffix": IDLE_SUFFIX, "role": "rest"},
-    "walk": {"action": "walking",                                "suffix": WALK_SUFFIX, "role": "active"},
-    "run":  {"action": "running fast",                           "suffix": RUN_SUFFIX,  "role": "active"},
-    "fly":  {"action": "flying with wings spread, mid-air",      "suffix": FLY_SUFFIX,  "role": "active"},
-    "hop":  {"action": "hopping",                                "suffix": HOP_SUFFIX,  "role": "active"},
-    "swim": {"action": "swimming",                               "suffix": SWIM_SUFFIX, "role": "active"},
+# --- Locomotion model -------------------------------------------------------
+# DatsMe's runtime has ONE locomotion strategy (quadruped) and it only carries a
+# pet ACROSS THE SCREEN for an animation literally named "walk" or "run"
+# (quadruped.ts motionPredicate). So EVERY pet ships exactly idle + walk + run:
+# idle is the only still pose, and walk (short/slow) + run (long/fast) both
+# actually travel. The manifest names stay "walk"/"run"; what changes per animal
+# is the *sprite motion* — a bird hops then flies, a snake slithers, a fish
+# swims. That keeps every non-idle animation moving AND valid for DatsMe today.
+
+# Motion primitives: gait key -> (action phrase for the prompt, Wan motion suffix).
+GAITS = {
+    "walk":       ("walking at a steady pace",                  WALK_SUFFIX),
+    "run":        ("running fast",                              RUN_SUFFIX),
+    "fly":        ("flying with wings spread, mid-air",         FLY_SUFFIX),
+    "hop":        ("hopping in small quick hops",               HOP_SUFFIX),
+    "leap":       ("leaping forward in big powerful bounds",    HOP_SUFFIX),
+    "swim_slow":  ("swimming slowly, gently gliding",           SWIM_SUFFIX),
+    "swim_fast":  ("darting quickly through the water",         SWIM_SUFFIX),
+    "crawl_slow": ("slowly crawling forward, body undulating",  CRAWL_SUFFIX),
+    "crawl_fast": ("quickly slithering forward, body rippling", CRAWL_SUFFIX),
 }
 
-# Keyword heuristics to pick an animal-appropriate default animation set from just
-# the name. Order matters: flyers checked before swimmers before hoppers.
-_FLYERS = ("bird", "jay", "robin", "sparrow", "finch", "cardinal", "eagle", "hawk", "owl",
-           "falcon", "parrot", "crow", "raven", "dove", "pigeon", "duck", "goose", "swan",
-           "seagull", "gull", "hummingbird", "woodpecker", "toucan", "flamingo", "peacock",
-           "chickadee", "wren", "bluebird", "dragon", "bat", "butterfly", "moth", "bee",
-           "wasp", "dragonfly", "fairy", "phoenix", "pegasus", "pterodactyl", "griffin")
-_SWIMMERS = ("fish", "shark", "whale", "dolphin", "orca", "octopus", "squid", "jellyfish",
-             "seahorse", "eel", "stingray", "koi", "goldfish", "clownfish", "betta",
-             "crab", "lobster", "seal", "otter", "manatee", "narwhal")
-_HOPPERS = ("rabbit", "bunny", "hare", "frog", "toad", "kangaroo", "wallaby", "grasshopper",
-            "cricket", "flea")
+# Per-category idle (rest) action so a resting fish floats rather than "sits".
+IDLE_ACTIONS = {
+    "default": "sitting calmly, resting",
+    "flyer":   "perched and resting, wings folded",
+    "swimmer": "hovering in place, gently floating, fins slowly moving",
+    "crawler": "coiled and resting, gently swaying",
+    "hopper":  "sitting calmly, resting",
+}
+
+# Per-category "excited" click-reaction action. DatsMe plays an animation
+# literally named "excited" when the user clicks their pet (useClickPetExcited).
+EXCITED_ACTIONS = {
+    "default": "jumping up and down excitedly, wiggling with joy",
+    "flyer":   "fluttering its wings excitedly, bouncing with joy",
+    "swimmer": "wiggling excitedly, doing a happy little wobble",
+    "crawler": "raising its head and wiggling excitedly",
+    "hopper":  "bouncing up and down excitedly",
+}
+
+# Per-category BASE SPRITE pose — the single still every loop is animated from.
+# "standing" made upright worms out of snakes and standing goldfish; the base
+# pose has to match how the animal actually holds itself.
+BASE_POSES = {
+    "default": "standing",
+    "flyer":   "standing perched",
+    "swimmer": "in a side-view swimming pose, mid-water",
+    "crawler": "low to the ground, long body extended in a gentle curve",
+    "hopper":  "sitting upright",
+}
+
+# Per-animation playback fps for the DatsMe manifest (the runtime honors
+# per-animation fps). Wan generates at 16; playing run at 16 keeps its energy,
+# idle slower reads calmer.
+ANIM_FPS = {"idle": 10, "walk": 12, "run": 16, "excited": 14}
+
+# How long DatsMe plays the click-triggered excited loop before returning to
+# rest (runtime_role "timed" + loop:true -> timed_buffer_ms IS the duration).
+EXCITED_PLAY_MS = 2400
+
+# Category -> which primitive drives the walk (short) and run (long) gait. Both
+# move the pet across the screen; idle is the only still animation.
+GAIT_PROFILES = {
+    "default": {"walk": "walk",       "run": "run"},
+    "flyer":   {"walk": "hop",        "run": "fly"},
+    "swimmer": {"walk": "swim_slow",  "run": "swim_fast"},
+    "hopper":  {"walk": "hop",        "run": "leap"},
+    "crawler": {"walk": "crawl_slow", "run": "crawl_fast"},
+}
+
+# Keyword heuristics -> category. Order matters (checked top to bottom): a "bee"
+# hits flyer before crawler, a "seahorse" hits swimmer, etc.
+_CATEGORY_KEYWORDS = (
+    ("flyer", ("bird", "jay", "robin", "sparrow", "finch", "cardinal", "eagle", "hawk",
+               "owl", "falcon", "parrot", "crow", "raven", "dove", "pigeon", "duck",
+               "goose", "swan", "seagull", "gull", "hummingbird", "woodpecker", "toucan",
+               "flamingo", "peacock", "chickadee", "wren", "bluebird", "magpie", "starling",
+               "dragon", "bat", "butterfly", "moth", "bee", "wasp", "dragonfly", "ladybug",
+               "fairy", "phoenix", "pegasus", "pterodactyl", "griffin", "gryphon")),
+    ("swimmer", ("fish", "shark", "whale", "dolphin", "orca", "octopus", "squid", "jellyfish",
+                 "seahorse", "stingray", "ray", "koi", "goldfish", "clownfish", "betta",
+                 "guppy", "tuna", "salmon", "crab", "lobster", "shrimp", "seal", "otter",
+                 "manatee", "narwhal", "walrus", "turtle", "axolotl")),
+    ("hopper", ("rabbit", "bunny", "hare", "frog", "toad", "kangaroo", "wallaby",
+                "grasshopper", "cricket", "flea")),
+    ("crawler", ("snake", "serpent", "python", "cobra", "viper", "boa", "anaconda", "worm",
+                 "earthworm", "snail", "slug", "caterpillar", "lizard", "gecko", "iguana",
+                 "chameleon", "salamander", "newt", "eel", "centipede", "millipede", "ant",
+                 "beetle", "cockroach", "roach", "scorpion", "spider", "crocodile",
+                 "alligator", "komodo")),
+)
 
 
-def _default_animations(animal: str) -> list:
-    """Pick an animal-appropriate default animation set from the name alone.
-    Birds/dragons/bats -> idle+fly+hop, fish -> idle+swim,
-    rabbits/frogs -> idle+hop+walk, everything else -> idle+walk."""
+def _category(animal: str) -> str:
     a = animal.lower()
-    if any(k in a for k in _FLYERS):
-        return ["idle", "fly", "hop"]
-    if any(k in a for k in _SWIMMERS):
-        return ["idle", "swim"]
-    if any(k in a for k in _HOPPERS):
-        return ["idle", "hop", "walk"]
-    return ["idle", "walk"]
+    for cat, kws in _CATEGORY_KEYWORDS:
+        if any(k in a for k in kws):
+            return cat
+    return "default"
 
 
+def _animation_plan(animal: str) -> list:
+    """Every pet gets idle + walk + run + excited. walk/run are the two gaits
+    DatsMe's quadruped runtime actually carries across the screen; their sprite
+    motion is tailored to the kind of animal (bird -> hop then fly, snake ->
+    slither slow then fast, fish -> swim slow then fast). idle is the rest pose;
+    excited is the click-reaction (played when the user clicks their pet).
+    Returns an ordered list of {name, action, suffix, role, fps}."""
+    cat = _category(animal)
+    prof = GAIT_PROFILES[cat]
+    plan = [{"name": "idle", "action": IDLE_ACTIONS.get(cat, IDLE_ACTIONS["default"]),
+             "suffix": IDLE_SUFFIX, "role": "rest", "fps": ANIM_FPS["idle"]}]
+    for gait_name in ("walk", "run"):
+        action, suffix = GAITS[prof[gait_name]]
+        plan.append({"name": gait_name, "action": action, "suffix": suffix,
+                     "role": "active", "fps": ANIM_FPS[gait_name]})
+    plan.append({"name": "excited", "action": EXCITED_ACTIONS.get(cat, EXCITED_ACTIONS["default"]),
+                 "suffix": EXCITED_SUFFIX, "role": "timed", "fps": ANIM_FPS["excited"]})
+    return plan
+
+
+# rembg session (lazy, reused)
 _REMBG = None
 
 
 def _rembg():
-    """Lazily create the birefnet cutout session. Prefers the GPU (CUDA, ~12x
-    faster) and falls back to CPU automatically if the CUDA libraries aren't
-    available — so it never breaks, just runs slower."""
     global _REMBG
     if _REMBG is None:
         from rembg import new_session
+        # Prefer the GPU (CUDA) — ~12x faster than CPU. Falls back to CPU if the
+        # CUDA libs/GPU aren't available (onnxruntime-gpu ships the CPU provider
+        # too), so this never breaks the cutout. CUDA libs are found via
+        # LD_LIBRARY_PATH set in run_worker.sh (borrowed from ComfyUI's torch).
         try:
             _REMBG = new_session("birefnet-general-lite",
                                  providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            print(f"[pet_factory] rembg providers: {_REMBG.inner_session.get_providers()}", flush=True)
+            provs = _REMBG.inner_session.get_providers()
+            print(f"[pet_factory] rembg providers: {provs}", flush=True)
             return _REMBG
         except Exception as e:
-            print(f"[pet_factory] CUDA cutout unavailable ({e}); using CPU", flush=True)
+            print(f"[pet_factory] CUDA rembg init failed ({e}); using CPU", flush=True)
+        # birefnet-general (SOTA matting) keeps white/light animals SOLID and
+        # consistent frame-to-frame. u2net left white bodies translucent or
+        # fully transparent on some frames; isnet hollowed them to an outline.
+        # Slower (~1-2s/frame on CPU) but the user prioritizes quality.
         _REMBG = new_session("birefnet-general-lite")
     return _REMBG
 
 
-def _remove_bg(img: Image.Image) -> Image.Image:
+_REMBG_CPU = None
+
+
+def _rembg_cpu():
+    """Separate CPU-only session, used per-frame when the CUDA session OOMs
+    (e.g. ComfyUI hasn't finished releasing VRAM) — CPU birefnet is ~12x
+    slower but always correct, which beats failing the job. Kept separate from
+    the GPU session so one transient OOM doesn't demote all future frames/jobs
+    to CPU."""
+    global _REMBG_CPU
+    if _REMBG_CPU is None:
+        from rembg import new_session
+        _REMBG_CPU = new_session("birefnet-general-lite", providers=["CPUExecutionProvider"])
+        print("[factory] rembg CPU fallback session created", flush=True)
+    return _REMBG_CPU
+
+
+def _remove_bg(img: Image.Image, session=None) -> Image.Image:
     from rembg import remove
-    return remove(img.convert("RGB"), session=_rembg())
+    return remove(img.convert("RGB"), session=session or _rembg())
+
+
+def _wait_vram_free(target_mb: int = 12000, timeout_s: int = 30):
+    """Block until GPU memory drops below target_mb (ComfyUI's /free releases
+    asynchronously and can take ~8s). Falls back to a fixed sleep if nvidia-smi
+    is unavailable. Prevents the birefnet CUDA session from OOMing against
+    still-loaded Wan models."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            used = int(out.stdout.strip().splitlines()[0])
+            if used < target_mb:
+                return
+        except Exception:
+            time.sleep(4)          # no nvidia-smi — best-effort fixed wait
+            return
+        time.sleep(1.0)
 
 
 # ── ComfyUI workflows ────────────────────────────────────────────────────────
 
 def _static_image_wf(prompt, seed):
-    """Z-Image-Turbo text-to-image (1024², 8-step turbo, CFG 1.0)."""
     return {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": ZIMAGE_UNET, "weight_dtype": "default"}},
         "2": {"class_type": "VAELoader", "inputs": {"vae_name": ZIMAGE_VAE}},
         "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": ZIMAGE_TE, "type": "lumina2"}},
         "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.0}},
         "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": prompt}},
-        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": NEG}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": ""}},
         "8": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
         "9": {"class_type": "KSampler", "inputs": {
             "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["8", 0],
@@ -173,8 +299,6 @@ def _static_image_wf(prompt, seed):
 
 
 def _loop_wf(prompt, start_image_path, seed, length=17, fps=16, width=704, height=704):
-    """Wan 2.2-I2V-14B looping sprite (two-expert MoE + LightX2V 4-step LoRA).
-    Same image as first AND last frame -> seamless loop. Saved as animated WebP."""
     return {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_UNET_HIGH, "weight_dtype": "default"}},
         "2": {"class_type": "UNETLoader", "inputs": {"unet_name": WAN_UNET_LOW, "weight_dtype": "default"}},
@@ -207,7 +331,6 @@ def _loop_wf(prompt, start_image_path, seed, length=17, fps=16, width=704, heigh
 
 
 def _run(wf: dict, timeout: int = 360) -> str:
-    """Queue a workflow on ComfyUI, wait for it, return the output filename."""
     r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": wf, "client_id": CLIENT_ID}, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"ComfyUI rejected workflow: {r.text[:200]}")
@@ -224,8 +347,8 @@ def _run(wf: dict, timeout: int = 360) -> str:
 
 
 def _wait_stable(path: Path, tries: int = 30):
-    """Wait until the file size stops changing (guards against reading a file
-    another process is still writing/re-encoding)."""
+    """Wait until the file size stops changing — anim_studio may be re-encoding
+    (stabilizing) it in place; reading mid-write yields a corrupt image."""
     last = -1
     for _ in range(tries):
         if path.exists():
@@ -237,10 +360,9 @@ def _wait_stable(path: Path, tries: int = 30):
 
 
 def _frames_rgba(path: Path) -> list:
-    """Decode a webp/gif/video output into a list of RGBA frames."""
     _wait_stable(path)
     last_err = None
-    for _ in range(6):
+    for _ in range(6):                       # retry around any residual write race
         try:
             if path.suffix.lower() in VIDEO_EXTS:
                 tmp = Path(tempfile.mkdtemp(prefix="pff_"))
@@ -249,6 +371,7 @@ def _frames_rgba(path: Path) -> list:
                                     str(tmp / "f_%05d.png")], check=True)
                     return [Image.open(p).convert("RGBA") for p in sorted(tmp.glob("f_*.png"))]
                 finally:
+                    import shutil
                     shutil.rmtree(tmp, ignore_errors=True)
             im = Image.open(path)
             return [fr.convert("RGBA") for fr in ImageSequence.Iterator(im)]
@@ -259,9 +382,13 @@ def _frames_rgba(path: Path) -> list:
 
 
 def _fill_holes_alpha(alpha: Image.Image, thr: int = 160) -> Image.Image:
-    """Make interior transparent regions (low alpha NOT connected to the image
-    border) fully opaque — closes any hole the matting model punches inside the
-    animal. Real background (reachable from the border) stays transparent."""
+    """Given an alpha matte (L), make interior transparent regions (low alpha NOT
+    connected to the image border) fully opaque — fixes rembg punching holes /
+    leaving semi-transparent patches inside the animal. Real background (reachable
+    from the border) stays transparent. Returns a corrected alpha (L).
+    Works on the mask only, so the caller composites it over the ORIGINAL RGB —
+    filled holes keep the animal's real color instead of turning black."""
+    from collections import deque
     a = np.array(alpha.convert("L"))
     h, w = a.shape
     transp = a < thr
@@ -289,7 +416,6 @@ def _fill_holes_alpha(alpha: Image.Image, thr: int = 160) -> Image.Image:
 
 
 def _fit_square(img: Image.Image, size: int) -> Image.Image:
-    """Scale-to-fit into a transparent size×size cell, centered (keeps aspect)."""
     img = img.convert("RGBA")
     w, h = img.size
     scale = size / max(w, h)
@@ -306,41 +432,56 @@ def _slug(animal: str) -> str:
 
 
 def _base_prompt(animal: str) -> str:
-    # "facing right" matters: DatsMe authors pets facing right and mirrors them
-    # for leftward movement, so the source must face right.
-    return (f"a cute cartoon {animal}, side profile view, facing right, standing, "
-            "soft pastel colors, muted palette, simple flat shading, white background, "
-            "storybook style")
+    # Pose per category (a goldfish shouldn't "stand"), and shadows are banned in
+    # the POSITIVE prompt — at CFG 1.0 a negative prompt would be ignored, and a
+    # painted ground shadow survives the birefnet cutout as a gray smudge.
+    pose = BASE_POSES.get(_category(animal), BASE_POSES["default"])
+    return (f"a cute cartoon {animal}, side profile view, facing right, {pose}, "
+            "soft pastel colors, muted palette, simple flat shading, "
+            "floating on a plain pure white background, no shadow, no ground shadow, "
+            "no reflection, storybook style")
 
 
 def _cutout_cells(frames, frame_size):
-    """birefnet cutout + fit each frame into a square transparent cell."""
+    """birefnet cutout + fit each frame into a square transparent cell.
+
+    A failed cutout FAILS THE JOB (after one retry) rather than falling back to
+    a fully-opaque alpha — that fallback would silently ship the whole white-
+    background frame as an ugly opaque square, the exact "shipped broken pet"
+    class the flood-key hybrid was reverted over. The worker reports the error
+    to the queue, so failing loudly here surfaces as a clean job error."""
     out = []
-    for fr in frames:
+    for i, fr in enumerate(frames):
         orig = fr.convert("RGB")
         try:
-            a = _remove_bg(orig).convert("RGBA").split()[3]     # birefnet alpha matte
+            a = _remove_bg(orig).convert("RGBA").split()[3]   # birefnet matte
         except Exception:
-            a = Image.new("L", orig.size, 255)
+            # Most likely the CUDA session OOMed against ComfyUI's VRAM.
+            # Retry on a CPU-only session (slow but always correct); only a
+            # CPU failure — something truly broken — fails the job.
+            try:
+                a = _remove_bg(orig, session=_rembg_cpu()).convert("RGBA").split()[3]
+            except Exception as e:
+                raise RuntimeError(f"background removal failed on frame {i}: {e}") from e
         result = orig.convert("RGBA")
-        result.putalpha(a)                                     # original colors + matte
+        result.putalpha(a)
         cell = _fit_square(result, frame_size)
-        cell.putalpha(_fill_holes_alpha(cell.split()[3]))      # close interior holes
+        cell.putalpha(_fill_holes_alpha(cell.split()[3]))     # close interior holes
         out.append(cell)
     return out
 
 
 def pack_datsme_bundle(anims, breed_id, display_name, frame_size=256, columns=8,
                        fps=12, movement_class="mammalian_quadruped") -> bytes:
-    """Pack N animations into one DatsMe breed bundle (.zip bytes): a transparent
-    sprite sheet + manifest.json + package.json.
+    """Pack N animations into one DatsMe breed bundle (.zip bytes).
 
-    `anims` = ordered list of {"name": str, "frames": [PIL images], "role": str}.
-    Each animation's frames are background-removed (birefnet), laid on a fresh grid
-    row, and given frame indices; the manifest maps col = idx % columns,
-    row = idx // columns. Roles are DatsMe runtime_roles ("rest" plays when idle,
-    "active" while moving). Returns the .zip as bytes — post it to DatsMe's
-    /api/pets/me/upload."""
+    `anims` = ordered list of {"name": str, "frames": [PIL images], "role": str,
+    "fps": int (optional, defaults to `fps`)}. Each animation's frames are cut
+    out, laid on a fresh grid row, and given frame indices; the manifest maps
+    col = idx % columns, row = idx // columns. Roles are DatsMe runtime_roles:
+    "rest" plays when idle, "active" while moving, "timed" plays for
+    timed_buffer_ms then returns to rest (used for the click-reaction).
+    """
     placed = []            # (index, cell) across all animations
     manifest_anims = {}
     cursor = 0
@@ -349,11 +490,15 @@ def pack_datsme_bundle(anims, breed_id, display_name, frame_size=256, columns=8,
         start = ((cursor + columns - 1) // columns) * columns   # each anim starts on a new row
         idx = list(range(start, start + len(cells)))
         placed.extend(zip(idx, cells))
-        entry = {"frames": idx, "fps": fps, "loop": True, "runtime_role": a["role"]}
+        entry = {"frames": idx, "fps": a.get("fps", fps), "loop": True,
+                 "runtime_role": a["role"],
+                 "view": {"view_kind": "side"}}   # lets quadruped apply travel tilt
         if a["role"] == "rest":
             entry["rest_dwell_ms"] = [2000, 5000]
-        else:
-            entry["pick_weight"] = 1.0
+        elif a["role"] == "timed":
+            # loop:true + timed -> timed_buffer_ms IS the play duration before
+            # the runtime returns the pet to rest (useAutoStateMachine).
+            entry["timed_buffer_ms"] = EXCITED_PLAY_MS
         manifest_anims[a["name"]] = entry
         cursor = start + len(cells)
     rows = (cursor + columns - 1) // columns
@@ -380,65 +525,48 @@ def pack_datsme_bundle(anims, breed_id, display_name, frame_size=256, columns=8,
     return buf.getvalue()
 
 
-def make_pet_zip(animal: str, on_progress=None, breed_id=None, animations=None):
-    """Generate a complete DatsMe pet from an animal name.
-
-    Args:
-        animal:       e.g. "red panda", "penguin", "baby dragon".
-        on_progress:  optional callback(message: str, fraction: float in 0..1).
-        breed_id:     optional slug override (else derived from `animal`).
-        animations:   optional list of preset names from ANIM_PRESETS
-                      (e.g. ["idle", "fly", "hop"]). Defaults to an
-                      animal-appropriate set — a bird gets idle+fly+hop, a fish
-                      idle+swim, most mammals idle+walk. "idle" is always
-                      included, and at least one motion animation is guaranteed.
-
-    Generates one looping animation per name from a single shared base sprite,
-    then packs a DatsMe bundle. Returns (breed_id, zip_bytes). Takes ~3-5 min on
-    an RTX 3090 depending on how many animations. The .zip is a DatsMe breed
-    bundle — upload it via DatsMe's POST /api/pets/me/upload.
-    """
+def make_pet_zip(animal: str, on_progress=None, breed_id=None):
+    """animal -> (breed_id, zip_bytes). Every pet gets idle + walk + run +
+    excited, with sprite motion tailored to the kind of animal (bird hops then
+    flies, snake slithers, fish swims). walk and run are the two gaits DatsMe's
+    quadruped runtime actually carries across the screen; excited is the
+    click-reaction DatsMe triggers when the user clicks their pet. All four
+    loops come from one shared base sprite."""
     def prog(msg, pct):
         if on_progress:
             on_progress(msg, pct)
 
     animal = (animal or "").strip()[:60] or "pet"
     seed = random.randint(1, 2**31)
-
-    names = [n for n in (animations or _default_animations(animal)) if n in ANIM_PRESETS]
-    if "idle" not in names:                      # DatsMe needs a rest animation
-        names = ["idle"] + names
-    if len(names) < 2:                           # always at least idle + one motion
-        names = names + ["walk"]
+    plan = _animation_plan(animal)               # idle + walk + run, tailored per animal
 
     prog("Drawing the base sprite…", 0.08)
     base = COMFY_OUTPUT_DIR / _run(_static_image_wf(_base_prompt(animal), seed))
     _wait_stable(base)
 
     # One Wan loop per animation, all from the same base sprite.
-    loop_files = {}
-    for i, name in enumerate(names):
-        p = ANIM_PRESETS[name]
-        prog(f"Animating the {name}…", 0.10 + 0.72 * (i / len(names)))
-        loop_files[name] = _run(_loop_wf(
-            f"cute cartoon {animal} {p['action']}, side profile, facing right" + p["suffix"],
-            str(base), seed))
+    loop_files = []
+    for i, step in enumerate(plan):
+        prog(f"Animating the {step['name']}…", 0.10 + 0.72 * (i / len(plan)))
+        loop_files.append(_run(_loop_wf(
+            f"cute cartoon {animal} {step['action']}, side profile, facing right" + step["suffix"],
+            str(base), seed)))
 
     prog("Cutting out backgrounds & packing…", 0.85)
-    # Unload ComfyUI's Wan models so the GPU has room for birefnet (the next job
-    # reloads them). Harmless if the endpoint isn't available.
+    # Unload ComfyUI's Wan models so the GPU has room for birefnet.
     try:
         requests.post(f"{COMFY_URL}/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-        time.sleep(1.5)
     except Exception:
         pass
+    _wait_vram_free()
 
     anims = []
-    for name in names:
-        frames = _frames_rgba(COMFY_OUTPUT_DIR / loop_files[name])
+    for step, fn in zip(plan, loop_files):
+        frames = _frames_rgba(COMFY_OUTPUT_DIR / fn)
         if len(frames) > 1:                      # drop the duplicated final loop frame
             frames = frames[:-1]
-        anims.append({"name": name, "frames": frames, "role": ANIM_PRESETS[name]["role"]})
+        anims.append({"name": step["name"], "frames": frames,
+                      "role": step["role"], "fps": step["fps"]})
 
     breed_id = breed_id or _slug(animal)
     zip_bytes = pack_datsme_bundle(anims, breed_id, animal.title())

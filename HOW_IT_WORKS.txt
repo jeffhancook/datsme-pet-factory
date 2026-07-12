@@ -24,23 +24,27 @@ finished DatsMe pet — all generated locally on a graphics card, no paid AI API
         |
         v
    [ STEP 1: DRAW THE BASE SPRITE ]  ~10s
-   A text-to-image model (Z-Image) draws one still picture of the animal,
-   standing in side profile, facing right, on a white background, in a soft
-   cartoon "storybook" style. This single picture is the character that ALL the
+   A text-to-image model (Z-Image) draws one still picture of the animal in
+   side profile, facing right, on a pure white background (the prompt bans
+   ground shadows — a painted shadow would survive the cutout as a gray
+   smudge), in a soft cartoon "storybook" style. The POSE matches the kind of
+   animal: a fish is drawn mid-water in a swimming pose, a snake low to the
+   ground, a bird perched. This single picture is the character that ALL the
    animations will be built from — so every animation looks like the same pet
    (not two different-looking red pandas).
         |
         v
    [ STEP 2: ANIMATE EACH ANIMATION ]  ~70s each
-   The pet gets an animal-appropriate SET of animations (an "idle" rest loop plus
-   one or more motion loops): a bird gets idle + fly + hop, a fish idle + swim,
-   most mammals idle + walk. For each one, an image-to-video model (Wan 2.2)
-   takes the SAME base still and animates it into a short looping clip of that
-   action IN PLACE (legs/wings moving, body bobbing, but not sliding across the
-   screen — the game moves the pet around; the sprite just needs to look like
-   it's doing the action). Each clip loops seamlessly (first frame = last frame),
-   ~16 frames. This step repeats once per animation in the set, which is why more
-   animations means a longer total time.
+   Every pet gets FOUR animations: idle (resting), walk + run (the two names
+   DatsMe's runtime actually moves across the screen — what they LOOK like is
+   the animal's natural gaits: a bird hops then flies, a snake slithers slow
+   then fast, a fish swims then darts), and excited (the reaction DatsMe plays
+   when the user clicks the pet). For each one, an image-to-video model
+   (Wan 2.2) takes the SAME base still and animates it into a short looping
+   clip of that action IN PLACE (legs/wings moving, body bobbing, but not
+   sliding across the screen — the game moves the pet around; the sprite just
+   needs to look like it's doing the action). Each clip loops seamlessly
+   (first frame = last frame), ~16 frames.
         |
         v
    [ STEP 3: CUT OUT THE BACKGROUND ]  ~13s per animation on GPU
@@ -53,12 +57,11 @@ finished DatsMe pet — all generated locally on a graphics card, no paid AI API
    All the frames are shrunk to a uniform size and laid out in a grid on one big
    transparent PNG ("sprite sheet"). Each animation is laid out on its own grid
    rows. A manifest.json is written that says which grid cells belong to which
-   animation ("walk", "fly", "idle"…), how fast to play them, and which is the
-   resting one, etc. It's all zipped up.
+   animation ("idle", "walk", "run", "excited"), how fast to play each one, and
+   which is the resting one, etc. It's all zipped up.
         |
         v
-   ("red_panda", <zip bytes>)   Total: ~3–5 minutes on an RTX 3090 (more
-                                animations = longer).
+   ("red_panda", <zip bytes>)   Total: ~5 minutes on an RTX 3090.
 
 
 --------------------------------------------------------------------------------
@@ -179,7 +182,7 @@ So "let users make their own pet" is basically:
 
     user types an animal
         -> DatsMe backend puts a job on the queue
-        -> the GPU worker generates the .zip (~3–5 min)
+        -> the GPU worker generates the .zip (~5 min)
         -> DatsMe either:
              (a) feeds the .zip to its own /api/pets/me/upload path, or
              (b) writes it straight into the user's pet storage with
